@@ -4,7 +4,8 @@
     "target": "es6",
     "lib": [
       "es2021",
-      "esnext.asynciterable"
+      "esnext.asynciterable",
+      "DOM"
     ],
     "allowSyntheticDefaultImports": true,
     "experimentalDecorators": true,
@@ -26,7 +27,8 @@
   },
   "include": [
     "./src/**/*.ts",
-    "./index.ts"
+    "./index.ts",
+    "uma-selfbot.ts"
   ],
   "exclude": [
     "node_modules"
