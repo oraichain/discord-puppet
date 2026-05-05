@@ -356,46 +356,112 @@ export default class Puppet {
         const safeId = listItemId.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
         const sel = `li[id="${safeId}"] [aria-roledescription="Open Thread Button"]`
         this.log(`[dispute]: open thread`)
-        await this.page.waitForSelector(sel, {visible: true, timeout: 20000})
+
+        // The list item should already be visible — it was just collected from
+        // the current scroll position.  Retry a few times with scrollIntoView
+        // in case it's slightly off-screen.
+        let found = false
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                await this.page.waitForSelector(sel, {visible: true, timeout: 3000})
+                found = true
+                break
+            } catch {
+                this.log(`[dispute]: open thread button not visible (attempt ${attempt + 1}/5), scrolling into view`)
+                await this.page.evaluate((liId: string) => {
+                    const el = document.getElementById(liId)
+                    if (el != null) {
+                        el.scrollIntoView({block: "center"})
+                    }
+                }, safeId)
+                await new Promise(r => setTimeout(r, 600))
+            }
+        }
+        if (!found) {
+            throw new Error(`openDisputeThreadFromListItem: selector not found after 5 attempts: ${sel}`)
+        }
+
         const urlBefore = this.page.url()
+        const olCountBefore = await this.page.evaluate(() =>
+            document.querySelectorAll('ol[data-list-id="chat-messages"]').length,
+        )
+
+        this.log(`[dispute]: clicking thread, url=${urlBefore}, olCount=${olCountBefore}`)
         await this.page.click(sel)
+
+        // Wait for thread view to be ready.  Discord may either:
+        //  A) Open a side panel (new ol appears: count increases)
+        //  B) Navigate to the thread page (URL changes)
+        // We wait for whichever happens first, then ensure the chat list is visible.
         try {
             await this.page.waitForFunction(
-                (u: string) => window.location.href !== u,
+                ([prevUrl, prevOlCount]: [string, number]) => {
+                    if (window.location.href !== prevUrl) return true
+                    const cur = document.querySelectorAll('ol[data-list-id="chat-messages"]').length
+                    if (cur > prevOlCount) return true
+                    return false
+                },
                 {timeout: 30000},
-                urlBefore,
+                [urlBefore, olCountBefore] as [string, number],
             )
         } catch {
-            this.log("[dispute]: URL still same; waiting for thread view")
-            await new Promise(r => setTimeout(r, 4500))
+            this.log("[dispute]: no URL change or new panel detected; waiting for thread view")
+            await new Promise(r => setTimeout(r, 3000))
         }
+
+        const urlAfter = this.page.url()
+        const olCountAfter = await this.page.evaluate(() =>
+            document.querySelectorAll('ol[data-list-id="chat-messages"]').length,
+        )
+        // Debug: log all channel IDs visible across all ol elements
+        const debugInfo = await this.page.evaluate(() => {
+            const ols = document.querySelectorAll('ol[data-list-id="chat-messages"]')
+            const result: {olIndex: number; channelIds: string[]; liCount: number}[] = []
+            for (let i = 0; i < ols.length; i++) {
+                const lis = ols[i].querySelectorAll('li[id^="chat-messages-"]')
+                const ids = new Set<string>()
+                for (let j = 0; j < lis.length; j++) {
+                    const parts = lis[j].id.split("-")
+                    if (parts.length >= 4) ids.add(parts[2])
+                }
+                result.push({olIndex: i, channelIds: Array.from(ids), liCount: lis.length})
+            }
+            return result
+        })
+        this.log(`[dispute]: after click url=${urlAfter}, olCount=${olCountAfter}, ols=${JSON.stringify(debugInfo)}`)
+
+        // Ensure at least one chat message list is visible
         await this.page.waitForSelector(`ol[data-list-id="chat-messages"]`, {
             visible: true,
-            timeout: 60000,
+            timeout: 30000,
         })
         await this.waitExecution()
     }
 
-    /**
-     * After viewing a thread opened from the list, return to the channel list.
-     */
-    async returnToDisputeChannelList(fallbackListUrl: string): Promise<void> {
-        this.log(`[dispute]: return to list`)
-        try {
-            await this.page.goBack({waitUntil: "load", timeout: 30000})
-        } catch {
-            await this.page.goto(fallbackListUrl, {waitUntil: "load"})
-        }
-        await this.page.waitForSelector(`ol[data-list-id="chat-messages"]`, {
-            visible: true,
-            timeout: 60000,
-        })
-        await this.waitExecution()
-    }
-
-    /** Same as scrolling older messages; works for dispute-threads list (same chat scroller). */
+    /** Scroll the channel thread list (first ol) older. Explicitly targets the
+     *  first ol to avoid accidentally scrolling the thread side panel. */
     async scrollChannelThreadListOlder(): Promise<void> {
-        await this.scrollChatOlder()
+        await this.page.evaluate(() => {
+            // The first ol is the channel list; subsequent ones are side panels.
+            const ol = document.querySelector('ol[data-list-id="chat-messages"]')
+            if (ol == null) return
+            let el: HTMLElement | null = ol as unknown as HTMLElement
+            for (let depth = 0; depth < 25 && el != null; depth++) {
+                const canScroll = el.scrollHeight > el.clientHeight + 5
+                const cls = el.classList.toString()
+                const st = window.getComputedStyle(el)
+                const overflowY = st.overflowY
+                if (
+                    canScroll &&
+                    (overflowY === "auto" || overflowY === "scroll" ||
+                        overflowY === "overlay" || cls.includes("scroller"))
+                ) {
+                    el.scrollTop = Math.max(0, el.scrollTop - Math.floor(el.clientHeight * 0.85))
+                    return
+                }
+                el = el.parentElement
+            }
+        })
     }
 
     /**
@@ -789,7 +855,7 @@ export default class Puppet {
      *
      * Returns the thread channelId to filter on, or "" for no filtering.
      */
-    private async detectThreadChannelId(pageUrl: string): Promise<string> {
+    async detectThreadChannelId(pageUrl: string): Promise<string> {
         // Extract parent channel ID from URL (always segment index 2)
         let parentChannelId = ""
         try {

@@ -74,7 +74,7 @@ async function main() {
         process.env.DISCORD_USERNAME || "",
         process.env.DISCORD_PASSWORD || "",
     )
-    config.headless = true
+    // config.headless = true
     const puppet = new Puppet(config)
 
     await puppet.start()
@@ -88,7 +88,6 @@ async function main() {
     await puppet.scrollChannelThreadListToLatest()
     await new Promise(r => setTimeout(r, 600))
 
-    const channelListUrl = puppet.getCurrentUrl()
     const newerThan = new Date(Date.now() - LOOKBACK_MS)
 
     await mkdir(OUTPUT_DIR, {recursive: true})
@@ -120,15 +119,13 @@ async function main() {
             }
 
             await puppet.openDisputeThreadFromListItem(row.listItemId)
-            await puppet.humanSleepReading()
+            await puppet.humanSleepReading(5000, 7000)
 
             const threadUrl = puppet.getCurrentUrl()
-            const threadId = Puppet.threadIdFromDiscordUrl(threadUrl)
+            const threadId = await puppet.detectThreadChannelId(threadUrl)
             if (threadId !== "" && scraped.threadIds.has(threadId)) {
                 console.log(`Skip (threadId ${threadId} already saved)`)
                 processedListItemIds.add(row.listItemId)
-                await puppet.returnToDisputeChannelList(channelListUrl)
-                await puppet.humanSleepReading()
                 continue
             }
 
@@ -157,9 +154,6 @@ async function main() {
             scraped.rowKeys.add(scrapedRowKey(row.title, row.activityIso))
 
             processedListItemIds.add(row.listItemId)
-
-            await puppet.returnToDisputeChannelList(channelListUrl)
-            await puppet.humanSleepReading(5, 7)
         }
 
         await puppet.scrollChannelThreadListOlder()
