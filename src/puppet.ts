@@ -490,6 +490,33 @@ export default class Puppet {
     }
 
     /**
+     * Thread view URL is either
+     * /channels/&lt;guild&gt;/&lt;parent&gt;/threads/&lt;threadId&gt; (current client)
+     * or /channels/&lt;guild&gt;/&lt;parent&gt;/&lt;threadId&gt; (legacy).
+     * Returns the thread snowflake for filtering message rows; null on parent channel only.
+     */
+    static activeThreadChannelIdFromUrl(url: string): string | null {
+        try {
+            const parts = new URL(url).pathname.split("/").filter(Boolean)
+            if (parts.length < 2 || parts[0] !== "channels") {
+                return null
+            }
+            const threadsIdx = parts.indexOf("threads")
+            if (threadsIdx !== -1 && threadsIdx < parts.length - 1) {
+                const id = parts[threadsIdx + 1]
+                return id != null && id !== "" ? id : null
+            }
+            if (parts.length === 4) {
+                const id = parts[3]
+                return id != null && id !== "" ? id : null
+            }
+            return null
+        } catch {
+            return null
+        }
+    }
+
+    /**
      * While on a forum channel page, scroll the post list and collect thread links.
      * Keeps threads whose list timestamp is missing or &gt;= newerThan.
      */
@@ -571,65 +598,120 @@ export default class Puppet {
      */
     async scrapeThreadMessagesSince(newerThan: Date): Promise<ThreadMessageRecord[]> {
         const sinceMs = newerThan.getTime()
+        const pageUrl = this.page.url()
+
+        // Detect the thread channelId from the DOM rather than relying solely on
+        // the URL.  When a thread panel is open, Discord renders two
+        // ol[data-list-id="chat-messages"] elements — one for the parent channel
+        // (left) and one for the thread (right panel).  The URL-based detection
+        // can return the parent channel ID for legacy 4-segment URLs
+        // (/channels/guild/parent/thread where the last segment IS the parent),
+        // which would cause us to capture parent-channel messages instead of
+        // thread messages.
+        //
+        // Strategy: extract the parent channel ID from the URL (always segment 2),
+        // then scan all visible message li elements and pick the channelId that
+        // differs from the parent.  If only one channelId is present and it equals
+        // the parent, fall back to URL-based detection (plain channel view).
+        const threadOnlyChannelId = await this.detectThreadChannelId(pageUrl)
+
+        // Scroll to the bottom of the thread first so the newest messages are
+        // visible before we start collecting and scrolling upward.
+        await this.scrollThreadToBottom(threadOnlyChannelId)
+
         const byId = new Map<string, ThreadMessageRecord>()
         let noNewRounds = 0
         for (let round = 0; round < 120 && noNewRounds < 8; round++) {
-            const chunk: ThreadMessageRecord[] = await this.page.evaluate(sMs => {
-                const lis = document.querySelectorAll(
-                    'ol[data-list-id="chat-messages"] > li[id^="chat-messages-"]',
-                )
-                const rows: ThreadMessageRecord[] = []
-                lis.forEach(li => {
-                    const id = li.id
-                    const parts = id.split("-")
-                    if (parts.length < 4) {
-                        return
-                    }
-                    const channelId = parts[2]
-                    const messageId = parts[3]
-                    const timeEl = li.querySelector("time[datetime]")
-                    const ts = timeEl?.getAttribute("datetime")
-                    if (ts == null || ts === "") {
-                        return
-                    }
-                    if (new Date(ts).getTime() < sMs) {
-                        return
-                    }
-                    const contentEl = li.querySelector('[id^="message-content-"]')
-                    const img = li.querySelector('a[data-role="img"]')
-                    const imageUrl =
-                        img != null ? img.getAttribute("href") : null
-                    let author: string | undefined
-                    const userEl = li.querySelector('[data-text][class*="username"]')
-                    if (userEl != null) {
-                        const dt = userEl.getAttribute("data-text")
-                        if (dt != null && dt !== "") {
-                            author = dt
-                        }
-                    }
-                    if (author == null || author === "") {
-                        const heading = li.querySelector("h3")
-                        if (heading != null) {
-                            const uname = heading.querySelector('[class*="username"]')
-                            const t0 =
-                                uname?.textContent?.trim() ||
-                                heading.querySelector("span")?.textContent?.trim()
-                            if (t0) {
-                                author = t0
+            const chunk: ThreadMessageRecord[] = await this.page.evaluate(
+                ([sMs, threadChId]) => {
+                    // When we have a threadChId, find the specific ol that
+                    // contains that thread's messages (the thread panel's ol),
+                    // rather than using the first ol which may be the parent
+                    // channel.
+                    let targetOl: Element | null = null
+                    if (threadChId !== "") {
+                        const allOls = document.querySelectorAll(
+                            'ol[data-list-id="chat-messages"]',
+                        )
+                        for (let oi = 0; oi < allOls.length; oi++) {
+                            if (
+                                allOls[oi].querySelector(
+                                    `li[id^="chat-messages-${threadChId}-"]`,
+                                )
+                            ) {
+                                targetOl = allOls[oi]
+                                break
                             }
                         }
                     }
-                    rows.push({
-                        messageId,
-                        channelId,
-                        author,
-                        timestamp: ts,
-                        content: contentEl != null ? contentEl.textContent : null,
-                        imageUrl,
+                    if (targetOl == null) {
+                        targetOl = document.querySelector(
+                            'ol[data-list-id="chat-messages"]',
+                        )
+                    }
+                    if (targetOl == null) {
+                        return []
+                    }
+                    const lis = targetOl.querySelectorAll(
+                        'li[id^="chat-messages-"]',
+                    )
+                    const rows: ThreadMessageRecord[] = []
+                    lis.forEach(li => {
+                        const id = li.id
+                        const parts = id.split("-")
+                        if (parts.length < 4) {
+                            return
+                        }
+                        const channelId = parts[2]
+                        const messageId = parts[3]
+                        if (threadChId !== "" && channelId !== threadChId) {
+                            return
+                        }
+                        const timeEl = li.querySelector("time[datetime]")
+                        const ts = timeEl?.getAttribute("datetime")
+                        if (ts == null || ts === "") {
+                            return
+                        }
+                        if (new Date(ts).getTime() < sMs) {
+                            return
+                        }
+                        const contentEl = li.querySelector('[id^="message-content-"]')
+                        const img = li.querySelector('a[data-role="img"]')
+                        const imageUrl =
+                            img != null ? img.getAttribute("href") : null
+                        let author: string | undefined
+                        const userEl = li.querySelector('[data-text][class*="username"]')
+                        if (userEl != null) {
+                            const dt = userEl.getAttribute("data-text")
+                            if (dt != null && dt !== "") {
+                                author = dt
+                            }
+                        }
+                        if (author == null || author === "") {
+                            const heading = li.querySelector("h3")
+                            if (heading != null) {
+                                const uname = heading.querySelector('[class*="username"]')
+                                const t0 =
+                                    uname?.textContent?.trim() ||
+                                    heading.querySelector("span")?.textContent?.trim()
+                                if (t0) {
+                                    author = t0
+                                }
+                            }
+                        }
+                        rows.push({
+                            messageId,
+                            channelId,
+                            author,
+                            timestamp: ts,
+                            content: contentEl != null ? contentEl.textContent : null,
+                            imageUrl,
+                        })
                     })
-                })
-                return rows
-            }, sinceMs)
+                    return rows
+                },
+                [sinceMs, threadOnlyChannelId] as [number, string],
+            )
 
             const beforeSize = byId.size
             for (const row of chunk) {
@@ -641,32 +723,220 @@ export default class Puppet {
                 noNewRounds = 0
             }
 
-            const moreAboveCutoff = await this.page.evaluate(sMs => {
-                const lis = document.querySelectorAll(
-                    'ol[data-list-id="chat-messages"] > li[id^="chat-messages-"]',
-                )
-                if (lis.length === 0) {
-                    return false
-                }
-                const first = lis[0]
-                const timeEl = first.querySelector("time[datetime]")
-                if (timeEl == null) {
-                    return true
-                }
-                return new Date(timeEl.getAttribute("datetime") as string).getTime() >= sMs
-            }, sinceMs)
+            const moreAboveCutoff = await this.page.evaluate(
+                ([sMs, threadChId]) => {
+                    // Find the correct ol (thread panel when applicable)
+                    let targetOl: Element | null = null
+                    if (threadChId !== "") {
+                        const allOls = document.querySelectorAll(
+                            'ol[data-list-id="chat-messages"]',
+                        )
+                        for (let oi = 0; oi < allOls.length; oi++) {
+                            if (
+                                allOls[oi].querySelector(
+                                    `li[id^="chat-messages-${threadChId}-"]`,
+                                )
+                            ) {
+                                targetOl = allOls[oi]
+                                break
+                            }
+                        }
+                    }
+                    if (targetOl == null) {
+                        targetOl = document.querySelector(
+                            'ol[data-list-id="chat-messages"]',
+                        )
+                    }
+                    if (targetOl == null) {
+                        return false
+                    }
+                    const sel =
+                        threadChId !== ""
+                            ? `li[id^="chat-messages-${threadChId}-"]`
+                            : `li[id^="chat-messages-"]`
+                    const lis = targetOl.querySelectorAll(sel)
+                    if (lis.length === 0) {
+                        return false
+                    }
+                    const first = lis[0]
+                    const timeEl = first.querySelector("time[datetime]")
+                    if (timeEl == null) {
+                        return true
+                    }
+                    return new Date(timeEl.getAttribute("datetime") as string).getTime() >= sMs
+                },
+                [sinceMs, threadOnlyChannelId] as [number, string],
+            )
 
             if (!moreAboveCutoff) {
                 break
             }
 
-            await this.scrollChatOlder()
+            await this.scrollThreadChatOlder(threadOnlyChannelId)
             await new Promise(r => setTimeout(r, Math.max(300, this.options.waitExecution / 2)))
         }
 
         return Array.from(byId.values()).sort(
             (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
         )
+    }
+
+    /**
+     * Detect the thread channelId by inspecting DOM message elements.
+     * When a thread panel is open, its messages have a channelId different
+     * from the parent channel.  The parent channel ID is URL segment index 2
+     * (`/channels/{guild}/{parentChannel}/...`).
+     *
+     * Returns the thread channelId to filter on, or "" for no filtering.
+     */
+    private async detectThreadChannelId(pageUrl: string): Promise<string> {
+        // Extract parent channel ID from URL (always segment index 2)
+        let parentChannelId = ""
+        try {
+            const parts = new URL(pageUrl).pathname.split("/").filter(Boolean)
+            // parts: ["channels", guildId, parentChannelId, ...]
+            if (parts.length >= 3 && parts[0] === "channels") {
+                parentChannelId = parts[2]
+            }
+        } catch {
+            // ignore
+        }
+
+        // If URL has /threads/<id>, use that directly — it's reliable
+        const urlThreadId = Puppet.activeThreadChannelIdFromUrl(pageUrl)
+        if (urlThreadId != null && urlThreadId !== parentChannelId) {
+            return urlThreadId
+        }
+
+        // Scan the DOM for all distinct channelIds across all chat message lists.
+        // Pick the one that differs from the parent channel.
+        const channelIds: string[] = await this.page.evaluate(() => {
+            const ids = new Set<string>()
+            const lis = document.querySelectorAll(
+                'ol[data-list-id="chat-messages"] > li[id^="chat-messages-"]',
+            )
+            for (let i = 0; i < lis.length; i++) {
+                const parts = lis[i].id.split("-")
+                if (parts.length >= 4) {
+                    ids.add(parts[2])
+                }
+            }
+            return Array.from(ids)
+        })
+
+        if (parentChannelId !== "") {
+            const threadId = channelIds.find(id => id !== parentChannelId)
+            if (threadId != null) {
+                return threadId
+            }
+        }
+
+        // Fallback: URL-based detection (may be "" for plain channel view)
+        return urlThreadId ?? ""
+    }
+
+    /**
+     * Scroll the thread panel to the bottom (newest messages) so that
+     * scraping always starts from the most recent end before scrolling up.
+     * When threadChannelId is set, finds the specific ol for that thread.
+     */
+    protected async scrollThreadToBottom(threadChannelId: string): Promise<void> {
+        for (let i = 0; i < 5; i++) {
+            await this.page.evaluate((threadChId: string) => {
+                let ol: Element | null = null
+                if (threadChId !== "") {
+                    const allOls = document.querySelectorAll(
+                        'ol[data-list-id="chat-messages"]',
+                    )
+                    for (let oi = 0; oi < allOls.length; oi++) {
+                        if (
+                            allOls[oi].querySelector(
+                                `li[id^="chat-messages-${threadChId}-"]`,
+                            )
+                        ) {
+                            ol = allOls[oi]
+                            break
+                        }
+                    }
+                }
+                if (ol == null) {
+                    ol = document.querySelector('ol[data-list-id="chat-messages"]')
+                }
+                if (ol == null) {
+                    return
+                }
+                let el: HTMLElement | null = ol as unknown as HTMLElement
+                for (let depth = 0; depth < 25 && el != null; depth++) {
+                    const canScroll = el.scrollHeight > el.clientHeight + 5
+                    const cls = el.classList.toString()
+                    const st = window.getComputedStyle(el)
+                    const overflowY = st.overflowY
+                    if (
+                        canScroll &&
+                        (overflowY === "auto" ||
+                            overflowY === "scroll" ||
+                            overflowY === "overlay" ||
+                            cls.includes("scroller"))
+                    ) {
+                        el.scrollTop = el.scrollHeight - el.clientHeight
+                        return
+                    }
+                    el = el.parentElement
+                }
+            }, threadChannelId)
+            await new Promise(r => setTimeout(r, 420))
+        }
+    }
+
+    /**
+     * Scroll up within the thread panel to load older messages.
+     * When threadChannelId is set, finds the specific ol containing that
+     * thread's messages rather than the first ol (which may be the parent
+     * channel).
+     */
+    protected async scrollThreadChatOlder(threadChannelId: string): Promise<void> {
+        await this.page.evaluate((threadChId: string) => {
+            let ol: Element | null = null
+            if (threadChId !== "") {
+                const allOls = document.querySelectorAll(
+                    'ol[data-list-id="chat-messages"]',
+                )
+                for (let i = 0; i < allOls.length; i++) {
+                    if (
+                        allOls[i].querySelector(
+                            `li[id^="chat-messages-${threadChId}-"]`,
+                        )
+                    ) {
+                        ol = allOls[i]
+                        break
+                    }
+                }
+            }
+            if (ol == null) {
+                ol = document.querySelector('ol[data-list-id="chat-messages"]')
+            }
+            if (ol == null) {
+                return
+            }
+            let el: HTMLElement | null = ol as unknown as HTMLElement
+            for (let depth = 0; depth < 25 && el != null; depth++) {
+                const canScroll = el.scrollHeight > el.clientHeight + 5
+                const cls = el.classList.toString()
+                const st = window.getComputedStyle(el)
+                const overflowY = st.overflowY
+                if (
+                    canScroll &&
+                    (overflowY === "auto" ||
+                        overflowY === "scroll" ||
+                        overflowY === "overlay" ||
+                        cls.includes("scroller"))
+                ) {
+                    el.scrollTop = Math.max(0, el.scrollTop - Math.floor(el.clientHeight * 0.85))
+                    return
+                }
+                el = el.parentElement
+            }
+        }, threadChannelId)
     }
 
     protected async scrollForumListForMore(): Promise<void> {

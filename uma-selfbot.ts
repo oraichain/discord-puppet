@@ -70,7 +70,7 @@ async function loadExistingUmaExports(dir: string): Promise<{
 }
 
 async function main() {
-    const config: Option = options(
+    let config: Option = options(
         process.env.DISCORD_USERNAME || "",
         process.env.DISCORD_PASSWORD || "",
     )
@@ -159,7 +159,7 @@ async function main() {
             processedListItemIds.add(row.listItemId)
 
             await puppet.returnToDisputeChannelList(channelListUrl)
-            await puppet.humanSleepReading()
+            await puppet.humanSleepReading(5, 7)
         }
 
         await puppet.scrollChannelThreadListOlder()
