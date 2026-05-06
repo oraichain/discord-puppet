@@ -73,6 +73,8 @@ async function main() {
     let config: Option = options(
         process.env.DISCORD_USERNAME || "",
         process.env.DISCORD_PASSWORD || "",
+        [],
+        process.env.DISCORD_USER_DATA_DIR || path.join(process.cwd(), ".discord-user-data"),
     )
     config.headless = process.env.HEADLESS === "true" ? true : false
     const puppet = new Puppet(config)
