@@ -74,7 +74,7 @@ async function main() {
         process.env.DISCORD_USERNAME || "",
         process.env.DISCORD_PASSWORD || "",
     )
-    // config.headless = true
+    config.headless = process.env.HEADLESS === "true" ? true : false
     const puppet = new Puppet(config)
 
     await puppet.start()

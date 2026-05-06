@@ -358,8 +358,10 @@ export default class Puppet {
         this.log(`[dispute]: open thread`)
 
         // The list item should already be visible — it was just collected from
-        // the current scroll position.  Retry a few times with scrollIntoView
-        // in case it's slightly off-screen.
+        // the current scroll position.  If it has been recycled by Discord's
+        // virtual list, try scrollIntoView first (works when in DOM but
+        // off-screen), then scroll the channel list to the bottom (latest) to
+        // re-materialize it, since rows were originally collected from there.
         let found = false
         for (let attempt = 0; attempt < 5; attempt++) {
             try {
@@ -368,13 +370,20 @@ export default class Puppet {
                 break
             } catch {
                 this.log(`[dispute]: open thread button not visible (attempt ${attempt + 1}/5), scrolling into view`)
-                await this.page.evaluate((liId: string) => {
+                const inDom = await this.page.evaluate((liId: string) => {
                     const el = document.getElementById(liId)
                     if (el != null) {
                         el.scrollIntoView({block: "center"})
+                        return true
                     }
+                    return false
                 }, safeId)
-                await new Promise(r => setTimeout(r, 600))
+                await new Promise(r => setTimeout(r, 500))
+                if (!inDom) {
+                    // Element not in DOM — scroll to bottom to re-materialize
+                    // the virtual list around the most-recently-active threads.
+                    await this.scrollChannelThreadListToLatest()
+                }
             }
         }
         if (!found) {
@@ -438,8 +447,10 @@ export default class Puppet {
         await this.waitExecution()
     }
 
-    /** Scroll the channel thread list (first ol) older. Explicitly targets the
-     *  first ol to avoid accidentally scrolling the thread side panel. */
+    /** Scroll the channel thread list (first ol) older by a small step so no
+     *  thread rows are skipped between consecutive collects.  Uses ~30% of
+     *  the viewport height per step so there is always overlap with the
+     *  previous visible window. */
     async scrollChannelThreadListOlder(): Promise<void> {
         await this.page.evaluate(() => {
             // The first ol is the channel list; subsequent ones are side panels.
@@ -456,7 +467,7 @@ export default class Puppet {
                     (overflowY === "auto" || overflowY === "scroll" ||
                         overflowY === "overlay" || cls.includes("scroller"))
                 ) {
-                    el.scrollTop = Math.max(0, el.scrollTop - Math.floor(el.clientHeight * 0.85))
+                    el.scrollTop = Math.max(0, el.scrollTop - Math.floor(el.clientHeight * 0.3))
                     return
                 }
                 el = el.parentElement
