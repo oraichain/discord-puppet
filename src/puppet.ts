@@ -1,3 +1,4 @@
+import {existsSync} from "fs"
 import puppeteer from "puppeteer-extra"
 import StealthPlugin from "puppeteer-extra-plugin-stealth"
 import UserDir from "puppeteer-extra-plugin-user-data-dir"
@@ -7,6 +8,26 @@ import {Message, Ids, Option} from "./interfaces"
 import {ForumThreadRef, ThreadMessageRecord, DisputeThreadRow} from "./interfaces/thread-export.interface"
 import {Label} from "./utils/language-pack";
 import {ValidateFn} from "./types/callback";
+
+/** Many Linux servers/VMs/containers lack a usable Chromium sandbox; see FATAL zygote_host_impl_linux "No usable sandbox". */
+function linuxNoSandboxArgs(): string[] {
+    return ["--no-sandbox", "--disable-setuid-sandbox"]
+}
+
+/** Default on Linux: disable sandbox so Puppeteer can start on AWS/Docker. Opt into real sandbox with PUPPETEER_USE_SANDBOX=1. */
+function mergeChromiumLaunchArgs(extraArgs: string[]): string[] {
+    const args = [...extraArgs]
+    if (
+        process.platform === "linux" &&
+        process.env.PUPPETEER_USE_SANDBOX !== "1"
+    ) {
+        args.unshift(...linuxNoSandboxArgs())
+    }
+    if (existsSync("/.dockerenv")) {
+        args.unshift("--disable-dev-shm-usage")
+    }
+    return args
+}
 
 export default class Puppet {
     protected browser: Browser
@@ -27,7 +48,7 @@ export default class Puppet {
         this.browser = await puppeteer.launch({
             headless: this.options.headless,
             userDataDir: this.options.userDataDir,
-            args: this.options.args,
+            args: mergeChromiumLaunchArgs(this.options.args),
             ignoreDefaultArgs: this.options.ignoreDefaultArgs
         })
         this.page = await this.browser.newPage()
