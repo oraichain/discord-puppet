@@ -60,16 +60,29 @@ Scrapes messages from UMA's `dispute-threads` Discord channel and saves each thr
 | `DISCORD_USERNAME` | — | Discord account email |
 | `DISCORD_PASSWORD` | — | Discord account password |
 | `THREAD_LOOKBACK_DAYS` | `1` | How many days back to scrape threads and messages |
+| `DISCORD_USER_DATA_DIR` | `.discord-user-data` | Directory where Chromium stores login session, cookies, and browser profile. Can be reused across runs to skip login/captcha. |
+| `HEADLESS` | `false` | Set to `"true"` to run in headless mode (server); `"false"` for visible browser window (development). |
 
 ---
 
 ## Running
 
+**Local development:**
 ```bash
 ts-node uma-selfbot.ts
 ```
 
-To run headless, set `config.headless = true` in `uma-selfbot.ts` (line 77).
+**Headless server (first time):**
+1. Run locally with `HEADLESS=false` to open a visible browser window, log in manually, and solve any captcha if prompted:
+   ```bash
+   HEADLESS=false ts-node uma-selfbot.ts
+   ```
+2. On subsequent server runs, set `HEADLESS=true` and reuse the saved session directory (see **Bypassing captcha on server** section below).
+
+**With custom lookback window:**
+```bash
+THREAD_LOOKBACK_DAYS=120 ts-node uma-selfbot.ts
+```
 
 ---
 
@@ -85,26 +98,45 @@ When "Open Thread" is clicked, Discord may either:
 - **Open a side panel** (right panel, 2nd `ol[data-list-id="chat-messages"]` appears, URL may or may not change).
 - **Navigate to the thread page** (URL changes, single `ol` with thread messages replaces the channel list).
 
-The code detects readiness by waiting for either a URL change or an increase in the number of `ol[data-list-id="chat-messages"]` elements. A 3-second fallback handles cases where neither signal fires (e.g. side panel swap with same ol count).
+The code detects readiness by waiting for:
+1. URL change (full navigation), OR
+2. Increase in `ol[data-list-id="chat-messages"]` count (side panel opens), OR
+3. Change in the second ol's channelId (panel swaps to a different thread while olCount stays at 2).
 
-### Two `ol[data-list-id="chat-messages"]` elements
+A 3-second fallback handles edge cases where none of these signals fire.
+
+### Two `ol[data-list-id="chat-messages"]` elements and scoping
 When the thread side panel is open, there are two `ol` elements in the DOM:
 1. **First `ol`**: the channel list (thread stubs with "Open Thread" buttons).
-2. **Last `ol`**: the thread side panel (actual thread messages).
+2. **Second `ol`**: the thread side panel (actual thread messages).
 
-Every method that queries messages or scrolls must target the correct `ol`:
-- `scrollChannelThreadListOlder` explicitly targets the first `ol` to avoid scrolling the side panel.
-- `scrapeThreadMessagesSince`, `scrollThreadChatOlder`, and `scrollThreadToBottom` identify the correct `ol` by scanning for `li[id^="chat-messages-{threadChannelId}-"]`.
+**Critical**: all queries that interact with the channel list MUST target the **first `ol` only**, because:
+- `li` elements have the same `id` format in both ols (e.g., `chat-messages-964000735073284127-1500776617969193100`).
+- Global selectors like `li[id="..."]` without an ol prefix will match elements in either ol, causing clicks to hit the wrong element or queries to mix data from both lists.
+
+Implementation:
+- `collectDisputeChannelThreadRows`: uses `querySelector()` to get the first ol, then queries its children only.
+- `openDisputeThreadFromListItem`: uses `page.evaluate` to find the button inside the first ol specifically, then clicks it via DOM `el.click()`.
+- `disputeChannelListPastLookbackCutoff`: scopes to the first ol's children.
+- `scrollChannelThreadListOlder`: explicitly targets the first ol to avoid scrolling the side panel.
+- Thread message collection (`scrapeThreadMessagesSince`, `scrollThreadChatOlder`, `scrollThreadToBottom`): identify the correct ol (which contains the thread) by scanning for `li[id^="chat-messages-{threadChannelId}-"]`.
 
 ### Thread channelId detection (`detectThreadChannelId`)
-The thread channelId (used for message filtering and deduplication) is detected from the DOM, not from the URL, because:
+The thread channelId (used for message filtering and deduplication) is detected from the DOM with priority to the URL, because:
 - When a thread opens as a side panel, the URL may not update.
-- Legacy 4-segment URLs (`/channels/{guild}/{parentChannel}`) return the parent channel ID from URL parsing, which is wrong.
+- Legacy 4-segment URLs (`/channels/{guild}/{parentChannel}`) return the parent channel ID, which is wrong for filtering.
+- When 2 ols exist (side panel open), the thread panel's `li` elements are in the second ol — not the first.
 
-Detection strategy:
+Detection strategy (in order):
 1. Extract parent channel ID from the URL (always segment index 2 in `/channels/{guild}/{parentChannel}/...`).
-2. If URL has `/threads/{id}` and that ID differs from the parent, use it directly.
-3. Otherwise, scan all `li[id^="chat-messages-"]` across all `ol` elements and pick the channelId that differs from the parent.
+2. If URL has `/threads/{id}` and that ID differs from the parent, use it directly (most reliable, fastest path).
+3. If 2+ ols exist (side panel open):
+   - Wait up to 5 seconds for the second ol to have at least one message `li`.
+   - Scan only the second ol's `li` elements and collect distinct channelIds.
+   - Pick the first non-parent channelId (the thread's channelId).
+4. If only 1 ol exists (full-page thread navigation):
+   - Scan all message `li` elements and pick the non-parent channelId.
+5. Fallback: URL-based detection (may be "" for plain channel view).
 
 ### Message ID format
 Every Discord message `li` element has `id="chat-messages-{channelId}-{messageId}"`. Parsing this gives both the channel the message belongs to and the message snowflake. Thread messages use the thread's own channelId (different from the parent channel), which is the key to filtering out parent-channel messages.
@@ -125,5 +157,55 @@ The scroll loop checks whether the **first** (oldest) visible message in the thr
 ### `scrollChannelThreadListToLatest` on startup
 Called once at the start to scroll the thread list to the bottom (newest threads). Discord's thread list shows newest activity at the bottom in `dispute-threads`. This ensures the most recently active threads are visible first before collection starts.
 
-### Idle scroll limit
-The outer loop scrolls older after each batch. If 6 consecutive scroll rounds produce no new threads to process, the loop exits. This prevents infinite loops when the channel has very few threads in the lookback window.
+### Scroll termination: lookback cutoff
+The outer loop scrolls older after each batch. It stops when `disputeChannelListPastLookbackCutoff` returns `true`, meaning all visible thread stubs have timestamps older than the lookback window. The loop runs indefinitely (no idle counter) — the only stop condition is reaching the lookback cutoff date or an error.
+
+Note: When threads are already processed (saved in previous runs), new rows are still collected from the visible list but skipped via dedup checks. The presence of "already processed" rows does not trigger early exit — the loop only stops based on the lookback cutoff.
+
+### Scroll step size
+The outer loop calls `scrollChannelThreadListOlder()` which scrolls the first ol upward by 30% of its viewport height per scroll step. This overlap (70% of previous visible window stays visible) ensures no threads are skipped between consecutive `collectDisputeChannelThreadRows` calls.
+
+---
+
+## Bypassing captcha on server
+
+Discord may prompt for human verification (hCaptcha) during login if it detects suspicious activity. Rather than automating captcha solving (which is error-prone and expensive), the simplest approach is to **reuse an authenticated browser session** across runs:
+
+### Strategy: Session persistence
+
+1. **First run (local, interactive)**:
+   - Run with `HEADLESS=false` so you can see and interact with the browser:
+     ```bash
+     HEADLESS=false ts-node uma-selfbot.ts
+     ```
+   - The browser will open. Log in manually using your Discord credentials.
+   - If a captcha appears, solve it manually in the visible browser.
+   - The login session is automatically saved to the `DISCORD_USER_DATA_DIR` (default: `.discord-user-data/`).
+   - Let the script run to completion (it will scrape threads and save JSON files).
+
+2. **Subsequent server runs**:
+   - Copy the `.discord-user-data/` directory from your local machine to the server (e.g., via `scp`, git, or ZIP upload):
+     ```bash
+     # Local:
+     zip -r discord-user-data.zip .discord-user-data/
+     # Upload to server, then on server:
+     unzip discord-user-data.zip
+     ```
+   - Run the script on the server with `HEADLESS=true`:
+     ```bash
+     HEADLESS=true ts-node uma-selfbot.ts
+     ```
+   - The browser will reuse the saved session, bypass login entirely, and skip any captcha prompt.
+
+### Why this works
+
+- `puppeteer-extra-plugin-user-data-dir` persists Chromium's user profile directory, which includes:
+  - Login cookies and session tokens.
+  - Local storage and IndexedDB data (where Discord stores some state).
+  - Browser cache and profile metadata.
+- Discord recognizes the returning session and does not re-prompt for captcha.
+- The stealth plugin (`puppeteer-extra-plugin-stealth`) masks automation signals, further reducing captcha triggers.
+
+### When to refresh the session
+
+If the Discord session expires (e.g., after 30+ days of inactivity), you'll need to repeat the local login step to generate a fresh `.discord-user-data/` directory. On re-login, any new captcha can be solved manually with `HEADLESS=false`.
