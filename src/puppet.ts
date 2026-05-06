@@ -330,8 +330,12 @@ export default class Puppet {
             type Row = {listItemId: string; title: string; activityIso: string | null}
             const out: Row[] = []
             const seen = new Set<string>()
-            document
-                .querySelectorAll('ol[data-list-id="chat-messages"] > li[id^="chat-messages-"]')
+            // Use querySelector (not querySelectorAll) to get the FIRST ol only.
+            // When a thread side panel is open, the second ol contains thread
+            // messages — those must not be collected as thread rows.
+            const firstOl = document.querySelector('ol[data-list-id="chat-messages"]')
+            if (firstOl == null) return out
+            firstOl.querySelectorAll('li[id^="chat-messages-"]')
                 .forEach(li => {
                     const openBtn = li.querySelector(
                         '[aria-roledescription="Open Thread Button"][role="button"]',
@@ -373,9 +377,8 @@ export default class Puppet {
     /**
      * Click the in-list "Open Thread" control (channel list must be visible).
      */
-    async openDisputeThreadFromListItem(listItemId: string): Promise<void> {
+    async openDisputeThreadFromListItem(listItemId: string, prevThreadChannelId?: string): Promise<void> {
         const safeId = listItemId.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-        const sel = `li[id="${safeId}"] [aria-roledescription="Open Thread Button"]`
         this.log(`[dispute]: open thread`)
 
         // The list item should already be visible — it was just collected from
@@ -383,32 +386,36 @@ export default class Puppet {
         // virtual list, try scrollIntoView first (works when in DOM but
         // off-screen), then scroll the channel list to the bottom (latest) to
         // re-materialize it, since rows were originally collected from there.
-        let found = false
+        // All interactions must target the FIRST ol (parent channel list).
+        // When a thread side panel is open, a second ol exists for thread
+        // messages.  Global selectors like `li[id="..."]` can match either ol,
+        // causing clicks to hit the wrong element.
+        let clicked = false
         for (let attempt = 0; attempt < 5; attempt++) {
-            try {
-                await this.page.waitForSelector(sel, {visible: true, timeout: 3000})
-                found = true
+            const result = await this.page.evaluate((liId: string) => {
+                const firstOl = document.querySelector('ol[data-list-id="chat-messages"]')
+                if (firstOl == null) return "no-ol"
+                const li = firstOl.querySelector(`li[id="${liId}"]`)
+                if (li == null) return "no-li"
+                const btn = li.querySelector('[aria-roledescription="Open Thread Button"]') as HTMLElement | null
+                if (btn == null) return "no-btn"
+                li.scrollIntoView({block: "center"})
+                btn.click()
+                return "clicked"
+            }, safeId)
+
+            if (result === "clicked") {
+                clicked = true
                 break
-            } catch {
-                this.log(`[dispute]: open thread button not visible (attempt ${attempt + 1}/5), scrolling into view`)
-                const inDom = await this.page.evaluate((liId: string) => {
-                    const el = document.getElementById(liId)
-                    if (el != null) {
-                        el.scrollIntoView({block: "center"})
-                        return true
-                    }
-                    return false
-                }, safeId)
-                await new Promise(r => setTimeout(r, 500))
-                if (!inDom) {
-                    // Element not in DOM — scroll to bottom to re-materialize
-                    // the virtual list around the most-recently-active threads.
-                    await this.scrollChannelThreadListToLatest()
-                }
+            }
+            this.log(`[dispute]: open thread button not found in first ol (attempt ${attempt + 1}/5, result=${result})`)
+            await new Promise(r => setTimeout(r, 500))
+            if (result === "no-li") {
+                await this.scrollChannelThreadListToLatest()
             }
         }
-        if (!found) {
-            throw new Error(`openDisputeThreadFromListItem: selector not found after 5 attempts: ${sel}`)
+        if (!clicked) {
+            throw new Error(`openDisputeThreadFromListItem: could not click thread button in first ol after 5 attempts: ${listItemId}`)
         }
 
         const urlBefore = this.page.url()
@@ -416,8 +423,7 @@ export default class Puppet {
             document.querySelectorAll('ol[data-list-id="chat-messages"]').length,
         )
 
-        this.log(`[dispute]: clicking thread, url=${urlBefore}, olCount=${olCountBefore}`)
-        await this.page.click(sel)
+        this.log(`[dispute]: clicked thread in first ol, url=${urlBefore}, olCount=${olCountBefore}`)
 
         // Wait for thread view to be ready.  Discord may either:
         //  A) Open a side panel (new ol appears: count increases)
@@ -425,14 +431,22 @@ export default class Puppet {
         // We wait for whichever happens first, then ensure the chat list is visible.
         try {
             await this.page.waitForFunction(
-                ([prevUrl, prevOlCount]: [string, number]) => {
+                ([prevUrl, prevOlCount, prevChId]: [string, number, string]) => {
                     if (window.location.href !== prevUrl) return true
-                    const cur = document.querySelectorAll('ol[data-list-id="chat-messages"]').length
-                    if (cur > prevOlCount) return true
+                    const ols = document.querySelectorAll('ol[data-list-id="chat-messages"]')
+                    if (ols.length > prevOlCount) return true
+                    // Panel already open (olCount == 2): wait for second ol to show a different channelId
+                    if (prevChId !== "" && ols.length >= 2) {
+                        const lis = ols[1].querySelectorAll('li[id^="chat-messages-"]')
+                        for (let i = 0; i < lis.length; i++) {
+                            const parts = lis[i].id.split("-")
+                            if (parts.length >= 4 && parts[2] !== prevChId) return true
+                        }
+                    }
                     return false
                 },
                 {timeout: 30000},
-                [urlBefore, olCountBefore] as [string, number],
+                [urlBefore, olCountBefore, prevThreadChannelId ?? ""] as [string, number, string],
             )
         } catch {
             this.log("[dispute]: no URL change or new panel detected; waiting for thread view")
@@ -537,9 +551,10 @@ export default class Puppet {
     async disputeChannelListPastLookbackCutoff(lookbackStart: Date): Promise<boolean> {
         const sMs = lookbackStart.getTime()
         return await this.page.evaluate(sinceMs => {
-            const lis = document.querySelectorAll(
-                'ol[data-list-id="chat-messages"] > li[id^="chat-messages-"]',
-            )
+            // Scope to first ol only — second ol is the thread side panel
+            const firstOl = document.querySelector('ol[data-list-id="chat-messages"]')
+            if (firstOl == null) return false
+            const lis = firstOl.querySelectorAll('li[id^="chat-messages-"]')
             let sawOpenThread = false
             let anyInLookback = false
             let anyUnknownTime = false
@@ -906,8 +921,48 @@ export default class Puppet {
             return urlThreadId
         }
 
-        // Scan the DOM for all distinct channelIds across all chat message lists.
-        // Pick the one that differs from the parent channel.
+        // When a thread panel is open, Discord renders 2 ols. The second ol
+        // is always the thread panel. Wait up to 5s for it to have messages,
+        // then read channelIds only from that panel ol.
+        // If only 1 ol exists (full-page thread navigation), scan that one.
+        const olCount = await this.page.evaluate(() =>
+            document.querySelectorAll('ol[data-list-id="chat-messages"]').length,
+        )
+
+        if (olCount >= 2) {
+            // Wait for the thread panel (second ol) to load at least one message li
+            try {
+                await this.page.waitForFunction(
+                    () => {
+                        const ols = document.querySelectorAll('ol[data-list-id="chat-messages"]')
+                        if (ols.length < 2) return false
+                        return ols[1].querySelectorAll('li[id^="chat-messages-"]').length > 0
+                    },
+                    {timeout: 5000},
+                )
+            } catch {
+                // panel may genuinely be empty; proceed with whatever is there
+            }
+
+            const threadId = await this.page.evaluate((parentChId: string) => {
+                const ols = document.querySelectorAll('ol[data-list-id="chat-messages"]')
+                if (ols.length < 2) return ""
+                const lis = ols[1].querySelectorAll('li[id^="chat-messages-"]')
+                const ids = new Set<string>()
+                for (let i = 0; i < lis.length; i++) {
+                    const parts = lis[i].id.split("-")
+                    if (parts.length >= 4) ids.add(parts[2])
+                }
+                for (const id of Array.from(ids)) {
+                    if (id !== parentChId) return id
+                }
+                return Array.from(ids)[0] ?? ""
+            }, parentChannelId)
+
+            if (threadId !== "") return threadId
+        }
+
+        // Single-ol case: scan all messages and pick a non-parent channelId
         const channelIds: string[] = await this.page.evaluate(() => {
             const ids = new Set<string>()
             const lis = document.querySelectorAll(
@@ -915,18 +970,14 @@ export default class Puppet {
             )
             for (let i = 0; i < lis.length; i++) {
                 const parts = lis[i].id.split("-")
-                if (parts.length >= 4) {
-                    ids.add(parts[2])
-                }
+                if (parts.length >= 4) ids.add(parts[2])
             }
             return Array.from(ids)
         })
 
         if (parentChannelId !== "") {
             const threadId = channelIds.find(id => id !== parentChannelId)
-            if (threadId != null) {
-                return threadId
-            }
+            if (threadId != null) return threadId
         }
 
         // Fallback: URL-based detection (may be "" for plain channel view)

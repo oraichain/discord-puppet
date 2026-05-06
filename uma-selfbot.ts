@@ -103,6 +103,7 @@ async function main() {
         )
     }
 
+    let lastOpenedThreadChannelId = ""
     while (true) {
         const rows = await puppet.collectDisputeChannelThreadRows(newerThan)
         const fresh = rows.filter(r => !processedListItemIds.has(r.listItemId))
@@ -118,11 +119,12 @@ async function main() {
                 continue
             }
 
-            await puppet.openDisputeThreadFromListItem(row.listItemId)
+            await puppet.openDisputeThreadFromListItem(row.listItemId, lastOpenedThreadChannelId)
             await puppet.humanSleepReading(5000, 7000)
 
             const threadUrl = puppet.getCurrentUrl()
             const threadId = await puppet.detectThreadChannelId(threadUrl)
+            lastOpenedThreadChannelId = threadId || lastOpenedThreadChannelId
             if (threadId !== "" && scraped.threadIds.has(threadId)) {
                 console.log(`Skip (threadId ${threadId} already saved)`)
                 processedListItemIds.add(row.listItemId)
