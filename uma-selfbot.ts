@@ -101,9 +101,8 @@ async function main() {
         )
     }
 
-    let idleScrolls = 0
-    while (idleScrolls < 6) {
-        const prevCount = processedListItemIds.size
+    const MAX_SCROLL_ITERATIONS = 500
+    for (let scrollIter = 0; scrollIter < MAX_SCROLL_ITERATIONS; scrollIter++) {
         const rows = await puppet.collectDisputeChannelThreadRows(newerThan)
         const fresh = rows.filter(r => !processedListItemIds.has(r.listItemId))
 
@@ -164,12 +163,6 @@ async function main() {
                 `Thread list scrolled to stubs older than lookback (${LOOKBACK_DAYS}d); stopping.`,
             )
             break
-        }
-
-        if (processedListItemIds.size === prevCount) {
-            idleScrolls++
-        } else {
-            idleScrolls = 0
         }
     }
 
