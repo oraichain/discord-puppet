@@ -101,8 +101,7 @@ async function main() {
         )
     }
 
-    const MAX_SCROLL_ITERATIONS = 500
-    for (let scrollIter = 0; scrollIter < MAX_SCROLL_ITERATIONS; scrollIter++) {
+    while (true) {
         const rows = await puppet.collectDisputeChannelThreadRows(newerThan)
         const fresh = rows.filter(r => !processedListItemIds.has(r.listItemId))
 
