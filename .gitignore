@@ -6,3 +6,4 @@ build
 .npmrc
 cache
 uma-threads
+quality-uma-threads

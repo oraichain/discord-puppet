@@ -29,7 +29,7 @@
     "./src/**/*.ts",
     "./index.ts",
     "uma-selfbot.ts"
-  ],
+, "llm.ts"  ],
   "exclude": [
     "node_modules"
   ]
