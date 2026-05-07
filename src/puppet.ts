@@ -381,11 +381,31 @@ export default class Puppet {
         const safeId = listItemId.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
         this.log(`[dispute]: open thread`)
 
-        // The list item should already be visible — it was just collected from
-        // the current scroll position.  If it has been recycled by Discord's
-        // virtual list, try scrollIntoView first (works when in DOM but
-        // off-screen), then scroll the channel list to the bottom (latest) to
-        // re-materialize it, since rows were originally collected from there.
+        // Capture the current scroll position of the channel list before
+        // attempting to click.  Rows are collected at whatever scroll position
+        // the outer loop is at (not necessarily the absolute bottom), so if
+        // Discord's virtual list recycles the li we must restore THIS position
+        // — not scroll to the bottom — to re-materialize it.
+        const savedScrollTop = await this.page.evaluate(() => {
+            const ol = document.querySelector('ol[data-list-id="chat-messages"]')
+            if (ol == null) return 0
+            let el: HTMLElement | null = ol as unknown as HTMLElement
+            for (let depth = 0; depth < 25 && el != null; depth++) {
+                const canScroll = el.scrollHeight > el.clientHeight + 5
+                const st = window.getComputedStyle(el)
+                const cls = el.classList.toString()
+                if (
+                    canScroll &&
+                    (st.overflowY === "auto" || st.overflowY === "scroll" ||
+                        st.overflowY === "overlay" || cls.includes("scroller"))
+                ) {
+                    return el.scrollTop
+                }
+                el = el.parentElement
+            }
+            return 0
+        })
+
         // All interactions must target the FIRST ol (parent channel list).
         // When a thread side panel is open, a second ol exists for thread
         // messages.  Global selectors like `li[id="..."]` can match either ol,
@@ -411,7 +431,31 @@ export default class Puppet {
             this.log(`[dispute]: open thread button not found in first ol (attempt ${attempt + 1}/5, result=${result})`)
             await new Promise(r => setTimeout(r, 500))
             if (result === "no-li") {
-                await this.scrollChannelThreadListToLatest()
+                // Restore the scroll position to where this item was visible
+                // when it was collected.  scrollChannelThreadListToLatest()
+                // scrolls to the absolute bottom, which misses items collected
+                // from a mid-list position after several scrollChannelThreadListOlder
+                // calls.
+                await this.page.evaluate((pos: number) => {
+                    const ol = document.querySelector('ol[data-list-id="chat-messages"]')
+                    if (ol == null) return
+                    let el: HTMLElement | null = ol as unknown as HTMLElement
+                    for (let depth = 0; depth < 25 && el != null; depth++) {
+                        const canScroll = el.scrollHeight > el.clientHeight + 5
+                        const st = window.getComputedStyle(el)
+                        const cls = el.classList.toString()
+                        if (
+                            canScroll &&
+                            (st.overflowY === "auto" || st.overflowY === "scroll" ||
+                                st.overflowY === "overlay" || cls.includes("scroller"))
+                        ) {
+                            el.scrollTop = pos
+                            return
+                        }
+                        el = el.parentElement
+                    }
+                }, savedScrollTop)
+                await new Promise(r => setTimeout(r, 800))
             }
         }
         if (!clicked) {
@@ -1007,6 +1051,9 @@ export default class Puppet {
                             break
                         }
                     }
+                    // Thread has no messages yet — don't fall back to the
+                    // channel list ol or we'd scroll the wrong container.
+                    if (ol == null) return
                 }
                 if (ol == null) {
                     ol = document.querySelector('ol[data-list-id="chat-messages"]')
@@ -1134,8 +1181,7 @@ export default class Puppet {
 
     private log(message: string, ...args) {
         if (this.options.logs) {
-            const time = new Date().toISOString()
-            console.log(message, ...args, time)
+            console.log(message, ...args)
         }
     }
 

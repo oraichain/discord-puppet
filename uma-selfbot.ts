@@ -104,6 +104,7 @@ async function main() {
     }
 
     let lastOpenedThreadChannelId = ""
+    let idleScrollCount = 0
     while (true) {
         const rows = await puppet.collectDisputeChannelThreadRows(newerThan)
         const fresh = rows.filter(r => !processedListItemIds.has(r.listItemId))
@@ -112,6 +113,12 @@ async function main() {
             `Visible thread rows in last ${LOOKBACK_DAYS}d: ${rows.length} (${fresh.length} new to process)`,
         )
 
+        if (fresh.length === 0) {
+            idleScrollCount++
+        } else {
+            idleScrollCount = 0
+        }
+
         for (const row of fresh) {
             if (scraped.rowKeys.has(scrapedRowKey(row.title, row.activityIso))) {
                 console.log(`Skip (already in uma-threads): ${row.title}`)
@@ -119,7 +126,13 @@ async function main() {
                 continue
             }
 
-            await puppet.openDisputeThreadFromListItem(row.listItemId, lastOpenedThreadChannelId)
+            try {
+                await puppet.openDisputeThreadFromListItem(row.listItemId, lastOpenedThreadChannelId)
+            } catch (err) {
+                console.warn(`Could not open thread ${row.listItemId} (${row.title}): ${err}. Skipping.`)
+                processedListItemIds.add(row.listItemId)
+                continue
+            }
             await puppet.humanSleepReading(5000, 7000)
 
             const threadUrl = puppet.getCurrentUrl()
@@ -158,8 +171,17 @@ async function main() {
             processedListItemIds.add(row.listItemId)
         }
 
-        await puppet.scrollChannelThreadListOlder()
-        await new Promise(r => setTimeout(r, 600))
+        // Scroll more steps per iteration the longer we've seen no new threads,
+        // to move through already-processed history faster.
+        const scrollSteps = Math.min(1 + Math.floor(idleScrollCount / 2), 8)
+        if (scrollSteps > 1) {
+            console.log(`[scroll] idle×${idleScrollCount} → ${scrollSteps} steps`)
+        }
+        for (let s = 0; s < scrollSteps; s++) {
+            await puppet.scrollChannelThreadListOlder()
+            await new Promise(r => setTimeout(r, 300))
+        }
+        await new Promise(r => setTimeout(r, 300))
 
         if (await puppet.disputeChannelListPastLookbackCutoff(newerThan)) {
             console.log(
