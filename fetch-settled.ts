@@ -3,6 +3,7 @@
  *   "settled"        — "P2" (Yes) or "P1" (No)
  *   "polymarket_id"  — Polymarket numeric market ID
  *   "polymarket_slug"— Polymarket market slug (stable reference for future lookups)
+ *   "clarification"  — array of clarification strings from /market-clarifications (empty if none)
  *
  * Strategy:
  *   - Items with `market_id: NNN` in marketDescription → GET /markets/{id}
@@ -126,6 +127,17 @@ async function searchAndResolve(question: string): Promise<MarketResult> {
   return { settled: null, polymarket_id: null, polymarket_slug: null };
 }
 
+async function fetchClarifications(marketId: string): Promise<string[]> {
+  const data = await httpGet<Record<string, unknown>[]>(
+    `${GAMMA_BASE}/market-clarifications?market_id=${marketId}`
+  );
+  if (!Array.isArray(data)) return [];
+  return (data as Record<string, unknown>[])
+    .sort((a, b) => String(a["scheduledFor"] ?? "").localeCompare(String(b["scheduledFor"] ?? "")))
+    .map((c) => String(c["content"] ?? "").trim())
+    .filter(Boolean);
+}
+
 function stripTitleSuffix(title: string): string {
   return title.replace(/\s*-\s*\d+\s*$/, "").trim();
 }
@@ -144,8 +156,8 @@ async function main() {
 
   for (let i = 0; i < data.length; i++) {
     const item = data[i];
-    // Skip only if both settled and polymarket_slug are already populated
-    if ("settled" in item && "polymarket_slug" in item) continue;
+    // Skip only if settled, polymarket_slug, and clarification are all already populated
+    if ("settled" in item && "polymarket_slug" in item && "clarification" in item) continue;
 
     const title = (item["title"] as string) ?? "";
     const desc = (item["marketDescription"] as string) ?? "";
@@ -176,6 +188,21 @@ async function main() {
     } else {
       unresolved++;
       console.log(`  → not resolved yet (skipped)`);
+    }
+
+    // Fetch clarifications if we have a polymarket_id and haven't fetched yet
+    if (!("clarification" in item)) {
+      const marketId = (item["polymarket_id"] as string) ?? result.polymarket_id ?? "";
+      if (marketId) {
+        const clarifications = await fetchClarifications(marketId);
+        item["clarification"] = clarifications;
+        if (clarifications.length > 0) {
+          console.log(`  → ${clarifications.length} clarification(s) found`);
+        }
+        await sleep(200);
+      } else {
+        item["clarification"] = [];
+      }
     }
 
     await sleep(300);

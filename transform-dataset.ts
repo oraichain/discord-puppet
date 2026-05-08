@@ -32,6 +32,7 @@ interface SourceItem {
   settled?: string;
   polymarket_id: string;
   polymarket_slug: string;
+  clarification?: string[];
 }
 
 interface MergedMarket {
@@ -41,6 +42,7 @@ interface MergedMarket {
   question: string;
   resolution_criteria: string;
   settled: string | null;
+  clarification: string[];
   P1: LinkBlock[];
   P2: LinkBlock[];
   P4: LinkBlock[];
@@ -52,6 +54,7 @@ interface MarketRow {
   question: string;
   resolution_criteria: string;
   settled: string | null;
+  clarification: string[];
 }
 
 interface NewsRow {
@@ -117,6 +120,7 @@ function main() {
         question,
         resolution_criteria: resCriteria,
         settled: item.settled ?? null,
+        clarification: item.clarification ?? [],
         P1: [...(item.P1 ?? [])],
         P2: [...(item.P2 ?? [])],
         P4: [...(item.P4 ?? [])],
@@ -145,6 +149,7 @@ function main() {
       question: m.question,
       resolution_criteria: m.resolution_criteria,
       settled: m.settled,
+      clarification: m.clarification,
     });
 
     const directions: Array<["P1" | "P2" | "P4", LinkBlock[]]> = [
