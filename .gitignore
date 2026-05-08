@@ -7,3 +7,5 @@ build
 cache
 uma-threads
 quality-uma-threads
+dataset
+filter-sources.json
