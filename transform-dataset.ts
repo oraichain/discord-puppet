@@ -59,7 +59,7 @@ interface MarketRow {
 
 interface NewsRow {
   url: string;
-  market_id: string;
+  polymarket_id: string;
   question: string;
   direction: "P1" | "P2" | "P4";
   settled: string | null;
@@ -162,7 +162,7 @@ function main() {
       for (const url of collectUrls(blocks)) {
         newsRows.push({
           url,
-          market_id: m.threadId,
+          polymarket_id: m.polymarket_id,
           question: m.question,
           direction,
           settled: m.settled,
