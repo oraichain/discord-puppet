@@ -65,6 +65,14 @@ interface NewsRow {
   settled: string | null;
 }
 
+interface QuoteRow {
+  quote: string;
+  polymarket_id: string;
+  question: string;
+  direction: "P1" | "P2" | "P4";
+  settled: string | null;
+}
+
 function stripTitleSuffix(title: string): string {
   return title.replace(/\s*-\s*\d+\s*$/, "").trim();
 }
@@ -92,10 +100,18 @@ function collectUrls(blocks: LinkBlock[]): string[] {
   const result: string[] = [];
   for (const block of blocks) {
     for (const link of block.links) {
-      if (!seen.has(link)) {
-        seen.add(link);
-        result.push(link);
-      }
+      if (!seen.has(link)) { seen.add(link); result.push(link); }
+    }
+  }
+  return result;
+}
+
+function collectQuotes(blocks: LinkBlock[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const block of blocks) {
+    for (const q of block.quotes) {
+      if (q && !seen.has(q)) { seen.add(q); result.push(q); }
     }
   }
   return result;
@@ -103,7 +119,8 @@ function collectUrls(blocks: LinkBlock[]): string[] {
 
 function main() {
   const raw = fs.readFileSync(INPUT, "utf8");
-  const items: SourceItem[] = JSON.parse(raw);
+  const parsed = JSON.parse(raw);
+  const items: SourceItem[] = Array.isArray(parsed) ? parsed : (parsed.results ?? []);
 
   // Merge items with the same threadId
   const byThread = new Map<string, MergedMarket>();
@@ -141,6 +158,7 @@ function main() {
   // Build output rows
   const marketRows: MarketRow[] = [];
   const newsRows: NewsRow[] = [];
+  const quoteRows: QuoteRow[] = [];
 
   for (const m of markets) {
     marketRows.push({
@@ -160,13 +178,10 @@ function main() {
 
     for (const [direction, blocks] of directions) {
       for (const url of collectUrls(blocks)) {
-        newsRows.push({
-          url,
-          polymarket_id: m.polymarket_id,
-          question: m.question,
-          direction,
-          settled: m.settled,
-        });
+        newsRows.push({ url, polymarket_id: m.polymarket_id, question: m.question, direction, settled: m.settled });
+      }
+      for (const quote of collectQuotes(blocks)) {
+        quoteRows.push({ quote, polymarket_id: m.polymarket_id, question: m.question, direction, settled: m.settled });
       }
     }
   }
@@ -174,18 +189,16 @@ function main() {
   // Write output
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
-  const marketsPath = path.join(OUT_DIR, "markets.jsonl");
-  fs.writeFileSync(marketsPath, marketRows.map((r) => JSON.stringify(r)).join("\n"), "utf8");
-
-  const newsPath = path.join(OUT_DIR, "news.jsonl");
-  fs.writeFileSync(newsPath, newsRows.map((r) => JSON.stringify(r)).join("\n"), "utf8");
+  const toJsonl = (rows: unknown[]) => rows.map((r) => JSON.stringify(r)).join("\n");
+  fs.writeFileSync(path.join(OUT_DIR, "markets.jsonl"), toJsonl(marketRows), "utf8");
+  fs.writeFileSync(path.join(OUT_DIR, "news.jsonl"), toJsonl(newsRows), "utf8");
+  fs.writeFileSync(path.join(OUT_DIR, "quotes.jsonl"), toJsonl(quoteRows), "utf8");
 
   const labeled = marketRows.filter((r) => r.settled).length;
-  const totalUrls = newsRows.length;
   const uniqueUrls = new Set(newsRows.map((r) => r.url)).size;
-
   console.log(`markets.jsonl : ${marketRows.length} rows (${labeled} with settled label)`);
-  console.log(`news.jsonl    : ${totalUrls} rows (${uniqueUrls} unique URLs)`);
+  console.log(`news.jsonl    : ${newsRows.length} rows (${uniqueUrls} unique URLs)`);
+  console.log(`quotes.jsonl  : ${quoteRows.length} rows`);
 }
 
 main();

@@ -16,9 +16,13 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import "dotenv/config";
 
 const GAMMA_BASE = "https://gamma-api.polymarket.com";
 const FILTER_SOURCES_PATH = path.join(__dirname, "filter-sources.json");
+const LLM_BASE_URL = process.env.LLM_BASE_URL ?? "http://localhost:11434/v1";
+const LLM_MODEL = process.env.LLM_MODEL ?? "qwen2.5:3b";
+const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
 
 interface MarketResult {
   settled: string | null;
@@ -135,7 +139,7 @@ async function fetchClarifications(marketId: string): Promise<string[]> {
   return (data as Record<string, unknown>[])
     .sort((a, b) => String(a["scheduledFor"] ?? "").localeCompare(String(b["scheduledFor"] ?? "")))
     .map((c) => String(c["content"] ?? "").trim())
-    .filter(Boolean);
+    .filter((c) => c && !c.startsWith(`We're aware of the dispute on this market`));
 }
 
 function stripTitleSuffix(title: string): string {
@@ -146,9 +150,53 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+async function extractLinksFromClarifications(
+  clarifications: string[],
+): Promise<{ links: string[]; quotes: string[] }> {
+  if (clarifications.length === 0) return { links: [], quotes: [] };
+  const content = clarifications.join("\n\n");
+  const res = await fetch(`${LLM_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(LLM_API_KEY !== "" ? { Authorization: `Bearer ${LLM_API_KEY}` } : {}),
+    },
+    body: JSON.stringify({
+      model: LLM_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract all HTTP/HTTPS URLs from the clarification text. Return ONLY a JSON object: {\"links\": string[]}",
+        },
+        { role: "user", content },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0,
+      max_tokens: 500,
+    }),
+  });
+  if (!res.ok) {
+    console.log(`  LLM error ${res.status}: ${await res.text()}`);
+    return { links: [], quotes: [] };
+  }
+  const data = (await res.json()) as { choices: { message: { content: string } }[] };
+  const raw = data.choices?.[0]?.message?.content?.trim() ?? "";
+  try {
+    const parsed = JSON.parse(raw) as { links?: string[] };
+    return {
+      links: Array.isArray(parsed.links) ? parsed.links.filter((s) => typeof s === "string") : [],
+      quotes: clarifications,
+    };
+  } catch {
+    return { links: [], quotes: [] };
+  }
+}
+
 async function main() {
   const raw = fs.readFileSync(FILTER_SOURCES_PATH, "utf8");
-  const data: Record<string, unknown>[] = JSON.parse(raw);
+  const file = JSON.parse(raw) as { processed?: string[]; results?: Record<string, unknown>[] };
+  const data: Record<string, unknown>[] = Array.isArray(file) ? file : (file.results ?? []);
 
   const total = data.length;
   let updated = 0;
@@ -156,8 +204,14 @@ async function main() {
 
   for (let i = 0; i < data.length; i++) {
     const item = data[i];
-    // Skip only if settled, polymarket_slug, and clarification are all already populated
-    if ("settled" in item && "polymarket_slug" in item && "clarification" in item) continue;
+    // Skip only if all fields including clarification link extraction are done
+    if (
+      "settled" in item &&
+      "polymarket_slug" in item &&
+      "clarification" in item &&
+      "clarification_links_extracted" in item
+    )
+      continue;
 
     const title = (item["title"] as string) ?? "";
     const desc = (item["marketDescription"] as string) ?? "";
@@ -205,10 +259,28 @@ async function main() {
       }
     }
 
+    // Use LLM to extract links from clarifications and append to the settled outcome array
+    if (!("clarification_links_extracted" in item)) {
+      const settled = item["settled"] as "P1" | "P2" | null;
+      const clarifications = item["clarification"] as string[];
+      if (settled && (settled === "P1" || settled === "P2") && clarifications.length > 0) {
+        const { links, quotes } = await extractLinksFromClarifications(clarifications);
+        if (links.length > 0) {
+          const arr = (item[settled] as unknown[]) ?? [];
+          arr.push({ links, quotes });
+          item[settled] = arr;
+          console.log(`  → extracted ${links.length} link(s) from clarifications → appended to ${settled}`);
+        }
+      }
+      item["clarification_links_extracted"] = true;
+      await sleep(200);
+    }
+
     await sleep(300);
   }
 
-  fs.writeFileSync(FILTER_SOURCES_PATH, JSON.stringify(data, null, 2), "utf8");
+  if (!Array.isArray(file)) file.results = data;
+  fs.writeFileSync(FILTER_SOURCES_PATH, JSON.stringify(Array.isArray(file) ? data : file, null, 2), "utf8");
   console.log(`\nDone: ${updated} enriched, ${unresolved} unresolved out of ${total} total.`);
 }
 

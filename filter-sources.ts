@@ -5,7 +5,7 @@ import "dotenv/config";
 const INPUT_DIR = "./quality-uma-threads";
 const OUTPUT_FILE = "./filter-sources.json";
 const LLM_BASE_URL = process.env.LLM_BASE_URL ?? "http://localhost:11434/v1";
-const LLM_MODEL = process.env.LLM_MODEL ?? "gpt-4o-mini";
+const LLM_MODEL = process.env.LLM_MODEL ?? "qwen2.5:3b";
 const LLM_API_KEY = process.env.LLM_API_KEY ?? "";
 const MAX_FILES = Number(process.env.MAX_FILES ?? 10);
 const FILE_CONCURRENCY = Number(process.env.FILE_CONCURRENCY ?? 1);
